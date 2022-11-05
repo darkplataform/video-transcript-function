@@ -1,21 +1,7 @@
-/**
- * Copyright 2016 Google Inc. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for t`he specific language governing permissions and
- * limitations under the License.
- */
 'use strict';
 
 const functions = require('firebase-functions');
+const { Storage } = require('@google-cloud/storage');
 const mkdirp = require('mkdirp');
 const admin = require('firebase-admin');
 admin.initializeApp();
@@ -23,81 +9,123 @@ const spawn = require('child-process-promise').spawn;
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+const speech = require('@google-cloud/speech');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpeg_static = require('ffmpeg-static');
+const gcs = new Storage();
 
-// Max height and width of the thumbnail in pixels.
-const THUMB_MAX_HEIGHT = 200;
-const THUMB_MAX_WIDTH = 200;
-// Thumbnail prefix added to file names.
-const THUMB_PREFIX = 'thumb_';
 
 /**
- * When an image is uploaded in the Storage bucket We generate a thumbnail automatically using
- * ImageMagick.
- * After the thumbnail has been generated and uploaded to Cloud Storage,
- * we write the public URL to the Firebase Realtime Database.
+ * TODO
  */
-exports.generateThumbnail = functions.storage.object().onFinalize(async (object) => {
+
+ const runtimeOpts = {
+  timeoutSeconds: 540
+ }
+
+exports.transcriptVideo = functions.runWith(runtimeOpts).storage.object().onFinalize(async (object) => {
   // File and directory paths.
+  const fileBucket = object.bucket;
   const filePath = object.name;
-  const contentType = object.contentType; // This is the image MIME type
+  const contentType = object.contentType; // This is the video MIME type
   const fileDir = path.dirname(filePath);
   const fileName = path.basename(filePath);
-  const thumbFilePath = path.normalize(path.join(fileDir, `${THUMB_PREFIX}${fileName}`));
-  const tempLocalFile = path.join(os.tmpdir(), filePath);
-  const tempLocalDir = path.dirname(tempLocalFile);
-  const tempLocalThumbFile = path.join(os.tmpdir(), thumbFilePath);
+  // const thumbFilePath = path.normalize(path.join(fileDir, `${THUMB_PREFIX}${fileName}`));
+  // const tempLocalFile = path.join(os.tmpdir(), filePath);
+  // const tempLocalDir = path.dirname(tempLocalFile);
+  // const tempLocalThumbFile = path.join(os.tmpdir(), thumbFilePath);
 
-  // Exit if this is triggered on a file that is not an image.
-  if (!contentType.startsWith('image/')) {
-    return functions.logger.log('This is not an image.');
+  // Exit if this is triggered on a file that is not a video.
+  if (!contentType.startsWith('video/')) {
+    return functions.logger.log('Is not a video.');
   }
 
-  // Exit if the image is already a thumbnail.
-  if (fileName.startsWith(THUMB_PREFIX)) {
-    return functions.logger.log('Already a Thumbnail.');
+  // Exit if the audio is already converted.
+  if (fileName.endsWith('_output.flac')) {
+    functions.logger.log('Already a converted audio.');
+    return null;
   }
 
-  // Cloud Storage files.
-  const bucket = admin.storage().bucket(object.bucket);
-  const file = bucket.file(filePath);
-  const thumbFile = bucket.file(thumbFilePath);
-  const metadata = {
-    contentType: contentType,
-    // To enable Client-side caching you can set the Cache-Control headers here. Uncomment below.
-    // 'Cache-Control': 'public,max-age=3600',
-  };
+  const bucket = gcs.bucket(fileBucket);
+  const tempFilePath = path.join(os.tmpdir(), fileName);
+  // We add a '_output.flac' suffix to target audio file name. That's where we'll upload the converted audio.
+  const targetTempFileName = fileName.replace(/\.[^/.]+$/, '') + '_output.flac';
+  const targetTempFilePath = path.join(os.tmpdir(), targetTempFileName);
+  const targetStorageFilePath = path.join(path.dirname(filePath), targetTempFileName);
+
+  await bucket.file(filePath).download({destination: tempFilePath});
+  functions.logger.log('Audio downloaded locally to', tempFilePath);
+  // Convert the audio to mono channel using FFMPEG.
+
+  let command = ffmpeg(tempFilePath)
+      .setFfmpegPath(ffmpeg_static)
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .format('flac')
+      .output(targetTempFilePath);
+
+      await promisifyCommand(command);
+      functions.logger.log('Output audio created at', targetTempFilePath);
+      // Uploading the audio.
+      await bucket.upload(targetTempFilePath, {destination: targetStorageFilePath});
+      functions.logger.log('Output audio uploaded to', targetStorageFilePath);
+
+
+  // Instantiates a client
+  const client = new speech.SpeechClient();
+
+  // The path to the remote LINEAR16 file
+  const gcsUri = 'gs://customerexperiencewatcher.appspot.com/'+targetStorageFilePath;
+  functions.logger.log('gcsUri: '+gcsUri)
+
   
-  // Create the temp directory where the storage file will be downloaded.
-  await mkdirp(tempLocalDir)
-  // Download file from bucket.
-  await file.download({destination: tempLocalFile});
-  functions.logger.log('The file has been downloaded to', tempLocalFile);
-  // Generate a thumbnail using ImageMagick.
-  await spawn('convert', [tempLocalFile, '-thumbnail', `${THUMB_MAX_WIDTH}x${THUMB_MAX_HEIGHT}>`, tempLocalThumbFile], {capture: ['stdout', 'stderr']});
-  functions.logger.log('Thumbnail created at', tempLocalThumbFile);
-  // Uploading the Thumbnail.
-  await bucket.upload(tempLocalThumbFile, {destination: thumbFilePath, metadata: metadata});
-  functions.logger.log('Thumbnail uploaded to Storage at', thumbFilePath);
-  // Once the image has been uploaded delete the local files to free up disk space.
-  fs.unlinkSync(tempLocalFile);
-  fs.unlinkSync(tempLocalThumbFile);
-  // Get the Signed URLs for the thumbnail and original image.
-  const results = await Promise.all([
-    thumbFile.getSignedUrl({
-      action: 'read',
-      expires: '03-01-2500',
-    }),
-    file.getSignedUrl({
-      action: 'read',
-      expires: '03-01-2500',
-    }),
-  ]);
-  functions.logger.log('Got Signed URLs.');
-  const thumbResult = results[0];
-  const originalResult = results[1];
-  const thumbFileUrl = thumbResult[0];
-  const fileUrl = originalResult[0];
+
   // Add the URLs to the Database
-  await admin.database().ref('images').push({path: fileUrl, thumbnail: thumbFileUrl});
-  return functions.logger.log('Thumbnail URLs saved to database.');
+ // await admin.database().ref('images').push({path: fileUrl, thumbnail: thumbFileUrl});
+  await transcribeSpeech(client, gcsUri) 
+
+  // Once the audio has been uploaded delete the local file to free up disk space.
+  fs.unlinkSync(tempFilePath);
+  fs.unlinkSync(targetTempFilePath);
+
+  return functions.logger.log('finished.');
 });
+
+
+async function transcribeSpeech(client, gcsUri) {
+
+  const audio = {
+    uri: gcsUri,
+  };
+
+  // The audio file's encoding, sample rate in hertz, and BCP-47 language code
+  const config = {
+    enableAutomaticPunctuation: true,
+    //encoding: 'LINEAR16',
+    //sampleRateHertz: 16000,
+    languageCode: 'es-PE',
+    model: "default"
+  };
+
+  const request = {
+    audio: audio,
+    config: config,
+  };
+
+  // Detects speech in the audio file
+  // const [response] = await client.recognize(request);
+  const [operation] = await client.longRunningRecognize(request);
+  const [response] = await operation.promise();
+  const transcription = response.results
+    .map(result => result.alternatives[0].transcript)
+    .join('\n');
+  console.log(`Transcription: ${transcription}`);
+}
+
+
+// Makes an ffmpeg command return a promise.
+function promisifyCommand(command) {
+  return new Promise((resolve, reject) => {
+    command.on('end', resolve).on('error', reject).run();
+  });
+}
