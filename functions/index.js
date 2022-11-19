@@ -13,6 +13,7 @@ const speech = require('@google-cloud/speech');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpeg_static = require('ffmpeg-static');
 const gcs = new Storage();
+const language = require('@google-cloud/language');
 
 
 /**
@@ -57,11 +58,30 @@ exports.transcriptVideo = functions.runWith(runtimeOpts).storage.object().onFina
   functions.logger.log('Audio downloaded locally to', tempFilePath);
   // Convert the audio to mono channel using FFMPEG.
 
+  ffmpeg.ffprobe(tempFilePath,function(err, metadata) {
+    var audioCodec = null;
+    var videoCodec = null;
+    metadata.streams.forEach(function(stream){
+        if (stream.codec_type === "video")
+            videoCodec = stream.codec_name;
+        else if (stream.codec_type === "audio")
+            audioCodec = stream.codec_name;
+    });
+
+    console.log("Video codec: %s\nAudio codec: %s", videoCodec, audioCodec);
+});
+
   let command = ffmpeg(tempFilePath)
-      .setFfmpegPath(ffmpeg_static)
-      .audioChannels(1)
-      .audioFrequency(16000)
-      .format('flac')
+      //.setFfmpegPath(ffmpeg_static)
+      // .audioChannels(1)
+      // .audioFrequency(16000)
+      // .format('flac')
+      // .outputOptions([
+      //   '-vn',
+      //   '-acodec copy',
+      // ])
+      .audioCodec('flac')
+      .noVideo()
       .output(targetTempFilePath);
 
       await promisifyCommand(command);
@@ -78,11 +98,21 @@ exports.transcriptVideo = functions.runWith(runtimeOpts).storage.object().onFina
   const gcsUri = 'gs://customerexperiencewatcher.appspot.com/'+targetStorageFilePath;
   functions.logger.log('gcsUri: '+gcsUri)
 
+
+  const underScorePosition = fileName.indexOf('_');
+  const dotPosition = fileName.indexOf('.');
+  const taskId = fileName.substring(0,underScorePosition);
+  const userId = fileName.substring(underScorePosition+1,dotPosition);
+
+  console.log("underScorePosition: ", underScorePosition)
+  console.log("fileDir: ", fileDir);
+  console.log("taskId: ", taskId);
+  console.log("userId: ", userId);
   
 
   // Add the URLs to the Database
  // await admin.database().ref('images').push({path: fileUrl, thumbnail: thumbFileUrl});
-  await transcribeSpeech(client, gcsUri) 
+  await transcribeSpeech(client, gcsUri, fileDir, taskId, userId) 
 
   // Once the audio has been uploaded delete the local file to free up disk space.
   fs.unlinkSync(tempFilePath);
@@ -92,7 +122,7 @@ exports.transcriptVideo = functions.runWith(runtimeOpts).storage.object().onFina
 });
 
 
-async function transcribeSpeech(client, gcsUri) {
+async function transcribeSpeech(client, gcsUri, projectId, taskId, userId) {
 
   const audio = {
     uri: gcsUri,
@@ -120,6 +150,40 @@ async function transcribeSpeech(client, gcsUri) {
     .map(result => result.alternatives[0].transcript)
     .join('\n');
   console.log(`Transcription: ${transcription}`);
+
+  await analyzeSentiment(transcription, projectId, taskId, userId);
+}
+
+async function analyzeSentiment(transcription, projectId, taskId, userId) {
+  const client = new language.LanguageServiceClient();
+
+  const document = {
+    content: transcription,
+    type: 'PLAIN_TEXT',
+    language: 'ES',
+  };
+
+  // Detects the sentiment of the document
+  const [result] = await client.analyzeSentiment({document});
+
+  const sentiment = result.documentSentiment;
+  console.log(`Document sentiment:`);
+  console.log(`  Score: ${sentiment.score}`);
+  console.log(`  Magnitude: ${sentiment.magnitude}`);
+
+  const firestore = admin.firestore();
+  const assignmentRef = firestore.collection('assignments');
+  const query = assignmentRef.where('id', '==', projectId+taskId)
+                            .where('userId','==', userId);
+  await query.get().then(function(querySnapshot) {
+    querySnapshot.forEach(function(doc) {
+        doc.ref.update({
+            sentimentScore : sentiment.score,
+            sentimentMagnitude : sentiment.magnitude
+        });
+    });
+});
+
 }
 
 

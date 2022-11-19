@@ -2,6 +2,7 @@
   "name": "generate-thumbnail-functions",
   "description": "Generate Thumbnail Firebase Functions sample",
   "dependencies": {
+    "@google-cloud/language": "^5.1.0",
     "@google-cloud/speech": "^5.1.0",
     "@google-cloud/storage": "^6.6.0",
     "child-process-promise": "^2.2.1",
