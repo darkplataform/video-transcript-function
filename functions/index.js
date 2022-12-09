@@ -178,6 +178,7 @@ async function analyzeSentiment(transcription, projectId, taskId, userId) {
   await query.get().then(function(querySnapshot) {
     querySnapshot.forEach(function(doc) {
         doc.ref.update({
+            transcription : transcription,
             sentimentScore : sentiment.score,
             sentimentMagnitude : sentiment.magnitude
         });
